@@ -1,0 +1,30 @@
+# Environment files
+.env
+.env.*
+!.env.template
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local output artifacts
+output/*
+!output/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
