@@ -351,6 +351,7 @@ The cells do this in order:
 |---------|-------------|-----|
 | `400 invalid_payload: Not allowed when agent is specified` | Sending `tools` alongside `agent_reference` in the API call | This is already fixed in the notebook. If you see it in custom code, remove the top-level `tools` parameter. |
 | File upload succeeds but analysis fails | Storage not connected, or permissions haven't propagated | Re-check [Step 1b](#1b-grant-the-project-permission-to-use-that-storage) and [Step 1c](#1c-connect-storage-in-foundry-portal). Wait a few minutes and retry. |
+| `PermissionDeniedError: 403 - Failed to upload file using upload_url` on `files.create(purpose="assistants")` | The connected storage account has `publicNetworkAccess=Disabled` (often flipped by tenant security policy after initial setup), so Foundry can't reach it. Less commonly: project MI lost `Storage Blob Data Contributor`. | See [403 on file upload](#403-on-file-upload-failed-to-upload-file-using-upload_url) below. |
 | `Authorization failed` or `Access denied` | Your user account doesn't have a Foundry role | Run the command below to grant yourself access. |
 | No file downloaded after asking the agent to generate one | Agent didn't produce a file annotation | Rephrase your prompt to explicitly ask for a saved/exported file. |
 
@@ -365,3 +366,75 @@ az role assignment create `
   --role "Azure AI User" `
   --scope "/subscriptions/$SUB_ID/resourceGroups/$RG/providers/Microsoft.CognitiveServices/accounts/$FOUNDRY_RESOURCE"
 ```
+
+### 403 on file upload — `Failed to upload file using upload_url`
+
+Full error:
+
+```
+PermissionDeniedError: Error code: 403 - {'error': {'message':
+'Client error. Failed to upload file using upload_url.', ...}}
+```
+
+This is **Azure Storage** rejecting Foundry's upload, not Foundry itself. The most common cause is that the connected storage account had `publicNetworkAccess` flipped to `Disabled` by a tenant security policy sometime after initial setup — even if the original `az storage account create` worked fine.
+
+#### 1. Diagnose
+
+```powershell
+# ---- substitute your values ----
+$SUB_ID    = az account show --query id -o tsv
+$RG        = "<YOUR_RESOURCE_GROUP>"
+$STORAGE   = "<YOUR_STORAGE_ACCOUNT>"
+$FOUNDRY_RESOURCE = "<YOUR_FOUNDRY_RESOURCE_NAME>"
+$PROJECT_NAME     = "<YOUR_PROJECT_NAME>"
+# ---------------------------------
+
+# (a) Storage networking — is the public endpoint reachable?
+az storage account show -n $STORAGE -g $RG `
+  --query "{publicAccess:publicNetworkAccess, defaultAction:networkRuleSet.defaultAction, sharedKey:allowSharedKeyAccess, bypass:networkRuleSet.bypass}" -o json
+
+# (b) Project MI — does it still have the role?
+$PROJECT_MSI = az rest --method GET `
+  --url "https://management.azure.com/subscriptions/$SUB_ID/resourceGroups/$RG/providers/Microsoft.CognitiveServices/accounts/$FOUNDRY_RESOURCE/projects/$PROJECT_NAME`?api-version=2025-04-01-preview" `
+  --query "identity.principalId" -o tsv
+
+az role assignment list --assignee-object-id $PROJECT_MSI `
+  --scope "/subscriptions/$SUB_ID/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$STORAGE" `
+  --query "[].roleDefinitionName" -o tsv
+```
+
+What you're looking for:
+
+| Check | Healthy value | Broken value → fix |
+|-------|--------------|--------------------|
+| `publicAccess` | `Enabled` | `Disabled` → run fix below |
+| `defaultAction` | `Allow` (or `Deny` with a resource-instance exception) | `Deny` with no exception → run fix below |
+| Role | `Storage Blob Data Contributor` | empty → re-run [Step 1b](#1b-grant-the-project-permission-to-use-that-storage) |
+
+#### 2. Fix — Option A (simplest, restores `az storage account create` defaults)
+
+```powershell
+az storage account update -n $STORAGE -g $RG `
+  --public-network-access Enabled `
+  --default-action Allow `
+  --bypass AzureServices
+```
+
+Wait ~30 seconds for propagation, then re-run the failing notebook cell.
+
+#### 3. Fix — Option B (keeps storage locked down; preferred if your tenant policy disallows public access)
+
+Keep public access on but only allow Azure trusted services + your specific Foundry resource:
+
+```powershell
+az storage account update -n $STORAGE -g $RG `
+  --public-network-access Enabled `
+  --default-action Deny `
+  --bypass AzureServices
+
+az storage account network-rule add -n $STORAGE -g $RG `
+  --resource-id "/subscriptions/$SUB_ID/resourceGroups/$RG/providers/Microsoft.CognitiveServices/accounts/$FOUNDRY_RESOURCE" `
+  --tenant-id (az account show --query tenantId -o tsv)
+```
+
+> **Note:** If your tenant Azure Policy automatically re-flips `publicNetworkAccess` to `Disabled`, you'll need a **private endpoint** instead. That's beyond this README — talk to your cloud admin.
